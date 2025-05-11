@@ -15,6 +15,7 @@ from typing import (
 
 from alembic.autogenerate import comparators
 from alembic.autogenerate.api import AutogenContext
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import TextClause
 
@@ -160,9 +161,20 @@ class ReplaceableEntity:
         # All entities in the database for self's schema
         entities_in_database: List[T] = self.from_database(sess, schema=self.schema)
 
-        db_def = self.get_database_definition(sess, dependencies=dependencies)
+        try:
+            db_def = self.get_database_definition(sess, dependencies=dependencies)
+        except ProgrammingError as e:
+            # The table doesn't exist yet. Assuming it's a new table
+            # introduced in the same migration, proceed with this entity.
+            if e.orig.pgcode != '42P01':
+                raise e
+            db_def = None
 
         for x in entities_in_database:
+
+            # If the table doesn't exist yet, it's going to be a CreateOp
+            if db_def is None:
+                continue
 
             if (db_def.identity, normalize_whitespace(db_def.definition)) == (
                 x.identity,
@@ -327,10 +339,16 @@ def compare_registered_entities(
         try:
             maybe_op = entity.get_required_migration_op(sess, dependencies=has_create_or_update_op)
 
-            local_db_def = entity.get_database_definition(
-                sess, dependencies=has_create_or_update_op
-            )
-            local_entities.append(local_db_def)
+            try:
+                local_db_def = entity.get_database_definition(
+                    sess, dependencies=has_create_or_update_op
+                )
+                local_entities.append(local_db_def)
+            except ProgrammingError as e:
+                # The table doesn't exist yet. Assuming it's a new table
+                # introduced in this migration, proceed with this entity.
+                if e.orig.pgcode != '42P01':
+                    raise e
 
             if maybe_op:
                 upgrade_ops.ops.append(maybe_op)
@@ -391,7 +409,7 @@ def compare_registered_entities(
                         # No match was found locally
                         # If the entity passes the filters,
                         # we should create a DropOp
-                        upgrade_ops.ops.append(DropOp(db_entity))
+                        upgrade_ops.ops.append(DropOp(db_entity, cascade=True))
                         logger.info(
                             "Detected DropOp op for %s %s",
                             db_entity.__class__.__name__,
